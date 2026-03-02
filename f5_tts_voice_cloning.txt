@@ -1,0 +1,297 @@
+# Cell 1: Environment Setup and Installs
+!pip install -q torch torchaudio transformers peft vocos tqdm IPython numpy librosa soundfile f5-tts
+
+
+# Cell 2: Imports and MPS Device Config
+import os
+import io
+import math
+import random
+import re
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchaudio
+from peft import LoraConfig, get_peft_model
+from vocos import Vocos
+import IPython.display as ipd
+from tqdm.auto import tqdm
+
+# Hard constraint: Use PyTorch `mps` backend for Apple Silicon and avoid `torch.float16` to prevent instability
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+DEVICE = torch.device('mps')
+DTYPE = torch.float32 # MUST be float32, bfloat16 will crash M4 Pro during `torch._C._nn.linear` execution
+
+print(f"Device set to: {DEVICE}")
+print(f"Default datatype: {DTYPE}")
+
+
+# Cell 3: Phase 1 - Data Pipeline and Preprocessing
+
+class PatientVoiceDataset(Dataset):
+    def __init__(self, data_dir, text_file, target_sample_rate=24000):
+        self.data_dir = Path(data_dir)
+        self.target_sample_rate = target_sample_rate
+        self.samples = []
+        
+        with open(text_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                match = re.search(r'^\d+\s+(.*)', line)
+                text = match.group(1) if match else line
+                self.samples.append(text)
+                
+        self.audio_files = sorted(list(self.data_dir.glob('**/*.m4a')))
+        if len(self.audio_files) != len(self.samples):
+            print(f"Warning: Audio file count mismatch. Truncating.")
+            min_len = min(len(self.audio_files), len(self.samples))
+            self.audio_files = self.audio_files[:min_len]
+            self.samples = self.samples[:min_len]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        audio_path = self.audio_files[idx]
+        text = self.samples[idx]
+        
+        waveform, sr = torchaudio.load(audio_path)
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+        if sr != self.target_sample_rate:
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=self.target_sample_rate)
+            waveform = resampler(waveform)
+            
+        # Passing raw 24kHz audio; F5-TTS internal MelSpec handles exact sizing
+        return {"audio": waveform.squeeze(0), "text": text}
+
+def collate_fn(batch):
+    audios = [item['audio'] for item in batch]
+    texts = [item['text'] for item in batch]
+    
+    max_len = max(a.shape[0] for a in audios)
+    padded_audios = []
+    for a in audios:
+        pad_amount = max_len - a.shape[0]
+        padded_audios.append(F.pad(a, (0, pad_amount), value=0.0))
+        
+    audio_tensor = torch.stack(padded_audios)
+    return {"audio": audio_tensor.to(DEVICE), "text": texts}
+
+# dataset = PatientVoiceDataset(data_dir='./data/audio', text_file='./data/harvard_sent_text.txt')
+# dataloader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
+
+
+# Cell 4: Phase 2 - Model Initialization & LoRA Adaptation
+
+from f5_tts.api import F5TTS
+
+print("Initializing pretrained F5-TTS DiT Backbone (Downloads weights on first run)...")
+f5tts = F5TTS(device=str(DEVICE))
+
+# 1. Base Model Definition
+# Extracting the raw Diffusion Transformer (DiT) backbone
+base_model = f5tts.ema_model.transformer
+
+# CRITICAL Apple Silicon Fix: Explicitly cast the entire imported Safetensor weights to Float32 to prevent MPS crashes
+base_model.to(torch.float32)
+
+# We also extract F5-TTS's internal MelSpec module to convert our raw audio into proper mel sequences
+mel_spec_module = f5tts.ema_model.mel_spec
+
+# Vocab tools
+vocab_char_map = f5tts.ema_model.vocab_char_map
+from f5_tts.model.utils import list_str_to_idx
+
+# 2. Configure PEFT / LoRA
+# Inject LoRA adapters into Attention and MLP linear layers utilizing the exact module naming conventions of the F5-TTS DiT blocks.
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=["to_q", "to_k", "to_v", "to_out.0", "ff.0.0", "ff.2", "pwconv1", "pwconv2"],
+    lora_dropout=0.05,
+    bias="none"
+)
+
+model = get_peft_model(base_model, lora_config)
+model.print_trainable_parameters()
+
+# 3. Instantiate Vocos Vocoder (Strictly Frozen using the system's Vocoder)
+# Note: Vocos uses Conv1d architectures that hard crash the M4 Pro MLX/MPS engine. We strictly load it to CPU.
+vocoder = f5tts.vocoder
+vocoder.to(torch.device('cpu'))
+for param in vocoder.parameters():
+    param.requires_grad = False
+print("Vocoder fully frozen and loaded via f5_tts (Forced to CPU).")
+
+
+# Cell 5: Phase 3 - Custom Flow Matching Training Loop
+
+def train_flow_matching(model, dataloader, epochs=5, save_dir="./f5_tts_lora_adapters"):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    model.train()
+    
+    global_step = 0
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Pre-generating dummy data for the executable demo loop
+    if dataloader is None:
+        print("Using dummy 24kHz audio data for demo loop...")
+        dummy_audio = torch.randn(2, 48000).to(DEVICE) # B, Time (2 seconds)
+        dataloader = [{"audio": dummy_audio, "text": ["hello", "world"]}] * 50
+    
+    for epoch in range(epochs):
+        print(f"\n--- Epoch {epoch+1}/{epochs} ---")
+        for batch in tqdm(dataloader, desc="Training"):
+            optimizer.zero_grad()
+            
+            # --- 1. Target Mel Computation ---
+            # Input shape: (B, Time)
+            raw_audio = batch['audio'].to(DTYPE)
+            x_1 = mel_spec_module(raw_audio).permute(0, 2, 1) # Target Mel shape: (B, N, D)
+            
+            b, seq_len, dtype, _ = *x_1.shape[:2], x_1.dtype, x_1.device
+            
+            # Formulate text condition matrix across the full batch length
+            text_tensor = torch.zeros((b, 50), dtype=torch.long, device=DEVICE) 
+            for z, txt_str in enumerate(batch['text']):
+                txt_idx = list_str_to_idx([txt_str], vocab_char_map)[0]
+                text_tensor[z, :len(txt_idx)] = torch.tensor(txt_idx, dtype=torch.long, device=DEVICE)
+                
+            text = text_tensor
+            
+            # --- 2. Gaussian Noise x_0 ---
+            x_0 = torch.randn_like(x_1)
+            
+            # --- 3. Optimal Transport Path: x_t = (1-t) * x_0 + t * x_1 ---
+            # Sample t ~ U[0, 1]
+            time = torch.rand((b,), dtype=dtype, device=DEVICE)
+            t = time.unsqueeze(-1).unsqueeze(-1)
+            
+            x_t = (1 - t) * x_0 + t * x_1
+            
+            # Target Velocity 
+            target_velocity = x_1 - x_0
+            
+            # --- 4. Predict Velocity Field (Custom Flow Loop) ---
+            # Using standard drop conditions (classifier-free guidance simulation)
+            drop_audio_cond = random.random() < 0.3
+            drop_text = False
+            if random.random() < 0.2:
+                drop_audio_cond = True
+                drop_text = True
+                
+            # Condition is the partial masked sequence, for generic training we mask parts of x_1
+            # Here for simplicity of the mathematical loop we pass zeros or full x_1 based on dropout
+            cond = torch.zeros_like(x_1) if drop_audio_cond else x_1
+            
+            # Mask (fully True for simple sequence length matched batches context)
+            mask = torch.ones((b, seq_len), device=DEVICE, dtype=torch.bool)
+            
+            pred_velocity = model(
+                x=x_t, cond=cond, text=text, time=time, 
+                drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask
+            )
+            
+            # --- 5. Flow Matching MSE Loss ---
+            loss = F.mse_loss(pred_velocity, target_velocity)
+            
+            loss.backward()
+            optimizer.step()
+            
+            if global_step % 10 == 0:
+                print(f"Step {global_step} | Flow Matching Loss: {loss.item():.4f}")
+                
+            global_step += 1
+            
+    # Save the custom LoRA adapters securely to local dir
+    print(f"Saving LoRA adapters to {save_dir}")
+    model.save_pretrained(save_dir)
+
+# Run the pseudo training loop
+# train_flow_matching(model, dataloader)
+train_flow_matching(model, None, epochs=1) 
+
+
+# Cell 6: Phase 4 - Inference and Custom Mid-Point ODE Solver
+
+@torch.no_grad()
+def synthesize_speech_midpoint(model, text_str, anchor_audio_path, steps=16):
+    model.eval()
+    
+    # 1. Load Anchor Audio & append trailing silence
+    waveform, sr = torchaudio.load(anchor_audio_path)
+    if waveform.shape[0] > 1: waveform = torch.mean(waveform, dim=0, keepdim=True)
+    if sr != 24000: waveform = torchaudio.transforms.Resample(sr, 24000)(waveform)
+        
+    silence = torch.zeros((1, 24000)) # 1 sec silence
+    anchor_waveform = torch.cat([waveform, silence], dim=1).to(DEVICE).to(DTYPE)
+    
+    # Extract condition mel
+    cond = mel_spec_module(anchor_waveform).permute(0, 2, 1) # (1, N_cond, D)
+    cond_seq_len = cond.shape[1]
+    
+    text = list_str_to_idx([text_str], vocab_char_map).to(DEVICE)
+    
+    # Compute target length (approximation)
+    target_seq_len = cond_seq_len + max(int(cond_seq_len * len(text_str)/50), cond_seq_len//2)
+    
+    cond_padded = F.pad(cond, (0, 0, 0, target_seq_len - cond_seq_len), value=0.0)
+    cond_mask = torch.zeros((1, target_seq_len), device=DEVICE, dtype=torch.bool)
+    cond_mask[0, :cond_seq_len] = True
+    step_cond = torch.where(cond_mask.unsqueeze(-1), cond_padded, torch.zeros_like(cond_padded))
+    
+    # 2. Mid-point ODE Solver for Flow Matching
+    dt = 1.0 / steps
+    print(f"Generating using custom {steps}-step Mid-Point ODE Solver...")
+    
+    x_t = torch.randn((1, target_seq_len, 100), device=DEVICE, dtype=DTYPE)
+    
+    for i in range(steps):
+        t_curr = torch.tensor([i * dt], device=DEVICE, dtype=DTYPE)
+        t_mid = torch.tensor([i * dt + dt/2], device=DEVICE, dtype=DTYPE)
+        
+        # Velocity at t_curr (cfg_infer=True simulates classifier free guidance internally in DiT block if supported)
+        v_curr = model(x=x_t, cond=step_cond, text=text, time=t_curr, mask=None, cfg_infer=False)
+        
+        # Step half to Midpoint
+        x_mid = x_t + v_curr * (dt / 2)
+        
+        # Velocity at t_mid
+        v_mid = model(x=x_mid, cond=step_cond, text=text, time=t_mid, mask=None, cfg_infer=False)
+        
+        # Final Full Step
+        x_t = x_t + v_mid * dt
+        
+    generated_mel = torch.where(cond_mask.unsqueeze(-1), cond_padded, x_t)
+    
+    # 3. Decode Spectrogram using frozen Vocos Vocoder
+    generated_mel_v = generated_mel.permute(0, 2, 1) # -> (1, 100, T)
+    
+    # CRITICAL Apple Silicon Fix: Vocos uses Conv1d architectures that hard crash the M4 Pro MLX/MPS engine.
+    # We explicitly move the final generated Mel tensor from MPS back to CPU for the Vocos decoding step.
+    mel_cpu_float32 = generated_mel_v.to(torch.device('cpu'), dtype=torch.float32)
+    out_waveform = vocoder.decode(mel_cpu_float32).squeeze().cpu().numpy()
+    
+    return out_waveform, 24000
+
+# Example Execution
+dummy_anchor = "./dummy_anchor.wav"
+if not os.path.exists(dummy_anchor):
+    torchaudio.save(dummy_anchor, torch.randn(1, 48000), 24000)
+
+audio_numpy, sr = synthesize_speech_midpoint(
+    model=model, 
+    text_str="This is a synthesized test of the few-shot voice cloning.", 
+    anchor_audio_path=dummy_anchor
+)
+
+# 4. Output Raw Waveform Directly into Notebook
+print("Generation Complete! Play Output:")
+ipd.display(ipd.Audio(audio_numpy, rate=sr))
+
