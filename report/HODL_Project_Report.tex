@@ -1,0 +1,380 @@
+\documentclass[11pt, a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{setspace}
+\usepackage{enumitem}
+\usepackage{natbib}
+\usepackage{xcolor}
+
+\onehalfspacing
+
+\title{\textbf{Few-Shot Voice Cloning for Vocal Preservation:\\In-Context Conditioning vs.\ Parametric Adaptation in F5-TTS}}
+\author{
+  Arthur Schoen \and Max S\"oderlind \and Lorenzo Tiraboschi\\[6pt]
+}
+\date{}
+
+\begin{document}
+\maketitle
+
+% ──────────────────────────────────────────────
+\begin{abstract}
+People with neurodegenerative diseases gradually lose the ability to speak in their own voice, and standard text-to-speech tools sound nothing like them. This project explores whether we can clone someone's voice from just a few seconds of audio using F5-TTS, a modern text-to-speech model. We focus on one key question: \emph{does fine-tuning the model on a person's voice recordings (using LoRA) help, or is it enough to simply feed the model a short audio clip of that person at generation time?}
+
+To answer this, we ran a grid experiment with two knobs: how much reference audio the model hears at generation time (0--8 seconds), and how many sentences we use to fine-tune the model (0--20). We tested all 45 combinations, generating 675 audio samples and measuring both how similar they sound to the original speaker and how accurately they reproduce the intended words.
+
+The answer is clear: giving the model a short reference clip matters far more than fine-tuning. Just 1.5 seconds of reference audio improves speaker similarity by +0.34 (on a 0-to-1 scale), while fine-tuning on 20 sentences adds at most +0.025. Even making the fine-tuning adapter 16 times larger does not close this gap. We also find that reference clips between 3 and 8 seconds hit the best balance of voice similarity and speech accuracy.
+\end{abstract}
+
+% ──────────────────────────────────────────────
+\section{Introduction}
+
+\subsection{Motivation}
+
+Diseases like ALS and Parkinson's can gradually take away a person's ability to speak. When that happens, patients often turn to text-to-speech systems---but these produce a generic robotic voice that sounds nothing like them. Imagine a father who can no longer read bedtime stories to his children in his own voice.
+
+Voice cloning could solve this problem: record the person's voice while they can still speak, and use it later to generate speech that sounds like them. However, older voice cloning methods need hours of recordings, which is impractical for someone whose voice is already declining. Modern ``few-shot'' methods aim to clone a voice from just a few seconds of audio.
+
+\subsection{Research Question}
+
+F5-TTS, the model we use, can copy a speaker's voice in two ways:
+
+\begin{enumerate}[itemsep=4pt]
+    \item \textbf{Reference audio at generation time (``anchor conditioning''):} We give the model a short clip of the target speaker's voice whenever we want to generate new speech. The model listens to this clip and tries to match the voice. No training is needed---this works out of the box.
+
+    \item \textbf{Fine-tuning on recordings (``LoRA adaptation''):} We train a small set of extra model weights on recordings of the target speaker. This bakes the speaker's voice characteristics into the model itself.
+\end{enumerate}
+
+Our research question is: \emph{when does fine-tuning actually help? Does it add anything beyond what the reference audio already provides?}
+
+Our hypothesis going in was that fine-tuning should help most when the reference audio is very short or absent---in other words, LoRA should fill in the gap when the model has little to listen to.
+
+% ──────────────────────────────────────────────
+\section{Background}
+
+\subsection{F5-TTS: How It Generates Speech}
+
+F5-TTS~\citep{chen2024f5tts} generates speech in three steps:
+
+\begin{enumerate}[itemsep=4pt]
+    \item \textbf{Input:} The model receives a text prompt (what to say), a reference audio clip (whose voice to use), and a transcript of that reference clip.
+
+    \item \textbf{Spectrogram generation:} A Diffusion Transformer (DiT) with 339.6 million parameters generates a mel-spectrogram---a visual representation of the audio's frequency content over time. It does this through a process called \emph{flow matching}: starting from random noise, the model gradually shapes it into a spectrogram that matches the text, guided by the reference voice. This takes 32 iterative steps in our experiments.
+
+    \item \textbf{Waveform conversion:} A vocoder (Vocos) converts the spectrogram into an audible waveform.
+\end{enumerate}
+
+The key property that makes F5-TTS useful for voice cloning is that it can copy a speaker's voice just from hearing a short reference clip---no training required. This is called \textbf{zero-shot} voice cloning.
+
+\subsection{LoRA: Lightweight Fine-Tuning}
+
+LoRA~\citep{hu2022lora} is a technique for fine-tuning large models without modifying all their weights. Instead of updating every parameter, LoRA adds small trainable matrices to specific layers. For a weight matrix $W$ with dimensions $d \times k$, LoRA adds an update $\Delta W = BA$ where $B$ is $d \times r$ and $A$ is $r \times k$, with $r$ being much smaller than $d$ or $k$. This means we only train $r \times (d + k)$ parameters instead of $d \times k$.
+
+In our setup, LoRA adds 2.5 million trainable parameters (0.74\% of the model), targeting the attention layers (which decide what to focus on) and feed-forward layers (which process information) inside the transformer.
+
+\subsection{How We Measure Quality}
+
+We use two metrics:
+
+\begin{itemize}[itemsep=4pt]
+    \item \textbf{Speaker similarity} (higher is better, range 0--1): We use Resemblyzer~\citep{wan2018generalized} to extract a ``voice fingerprint'' from both the generated audio and the original speaker's audio, then compute how similar they are using cosine similarity. A score of 0.9+ means the voices are very similar; below 0.7 means they sound like different people.
+
+    \item \textbf{Word Error Rate (WER)} (lower is better): We transcribe the generated audio using Whisper~\citep{radford2023robust} and compare it to what the model was supposed to say. A WER of 0.0 means perfect transcription; 1.0 means every word is wrong; values above 1.0 mean the model repeated or hallucinated extra words.
+\end{itemize}
+
+% ──────────────────────────────────────────────
+\section{Methodology}
+
+\subsection{Dataset}
+
+We recorded one speaker reading the 20 Harvard sentences~\citep{rothauser1969ieee}---a standard set of phonetically balanced English sentences designed to cover all speech sounds. The recording was about 5 minutes long.
+
+We used Stable Whisper to automatically align the audio to the text, producing 20 sentence-level clips (1.7--30.0\,s each) and 159 word-level clips (0.10--0.96\,s each).
+
+We split the data as follows:
+\begin{itemize}[itemsep=2pt]
+    \item \textbf{Anchor audio:} The first 3 sentences (7.2\,s total) were used as the reference clip that the model listens to at generation time.
+    \item \textbf{Training pool:} The remaining 17 sentences were available for LoRA fine-tuning.
+    \item \textbf{Test sentences:} 5 completely new sentences (not in the recording) were used to test the model, including ``The quick brown fox jumps over the lazy dog'' and ``Please call Stella and ask her to bring these things.''
+\end{itemize}
+
+\subsection{Experimental Design}
+
+We set up a grid experiment with two variables:
+
+\begin{itemize}[itemsep=4pt]
+    \item \textbf{Anchor duration} (how much reference audio the model hears): We tested 9 values: 0, 0.5, 1, 1.5, 2, 3, 4, 6, and 8 seconds. At 0\,s, the model gets no voice reference at all and must rely entirely on fine-tuning. At 8\,s, it hears the full anchor clip.
+
+    \item \textbf{Training sentences} (how much data LoRA is trained on): We tested 5 values: 0, 1, 5, 10, and 20 sentences. At 0 sentences, there is no fine-tuning and the model uses only the reference audio.
+\end{itemize}
+
+This gives us $9 \times 5 = 45$ conditions. For each condition, we generated all 5 test sentences with 3 different random seeds, giving 15 samples per condition and \textbf{675 total audio samples}. This repetition lets us compute averages and standard deviations, so we can tell whether observed differences are real or just random noise.
+
+\subsection{Model and Training Setup}
+
+We used the pretrained F5-TTS v1 model (339.6M parameters). LoRA adapters were configured with rank $r = 8$, scaling factor $\alpha = 16$, and 5\% dropout, giving 2,523,136 trainable parameters.
+
+Training details:
+\begin{itemize}[itemsep=2pt]
+    \item Optimizer: AdamW with learning rate $7 \times 10^{-5}$ and weight decay 0.01
+    \item Schedule: Warmup followed by cosine decay
+    \item Gradient accumulation: 4 steps (to simulate a larger batch size)
+    \item Epochs: More epochs for less data (60 for 1 sentence, 30 for 5, 20 for 10, 15 for 20), so total training effort stays roughly constant across conditions
+    \item Checkpoint selection: We saved the model weights that gave the best speaker similarity during training (checked every 3 epochs), rather than just using the final weights
+\end{itemize}
+
+We also ran two follow-up experiments:
+\begin{enumerate}[itemsep=2pt]
+    \item \textbf{Anchor duration diagnostics:} A detailed look at how similarity and errors change across anchor durations, to explain unexpected patterns in the grid results.
+    \item \textbf{LoRA rank sweep:} We tested LoRA ranks of 2, 4, 8, 16, and 32 (ranging from 630K to 10.1M trainable parameters) to see if a bigger adapter can substitute for reference audio.
+\end{enumerate}
+
+All experiments ran on an NVIDIA H100 80GB GPU via Google Colab.
+
+% ──────────────────────────────────────────────
+\section{Results}
+
+\subsection{Main Grid Experiment}
+
+Table~\ref{tab:sim_grid} shows how similar the generated voice sounds to the original speaker across all 45 conditions.
+
+\begin{table}[H]
+\centering
+\caption{Speaker similarity (mean, with standard deviation in parentheses). Higher is better. Each row is an anchor duration; each column is a training data amount.}
+\label{tab:sim_grid}
+\small
+\begin{tabular}{@{}l ccccc@{}}
+\toprule
+\textbf{Anchor} & \textbf{0 sent} & \textbf{1 sent} & \textbf{5 sent} & \textbf{10 sent} & \textbf{20 sent} \\
+\midrule
+0\,s   & .590 (.05) & .589 (.05) & .593 (.05) & .600 (.06) & .595 (.05) \\
+0.5\,s & .793 (.04) & .793 (.04) & .818 (.03) & .818 (.03) & .812 (.03) \\
+1\,s   & .904 (.03) & .904 (.03) & .914 (.03) & .915 (.03) & .909 (.03) \\
+1.5\,s & .930 (.02) & .930 (.02) & .933 (.02) & .935 (.02) & .933 (.02) \\
+2\,s   & .898 (.03) & .898 (.03) & .901 (.03) & .904 (.03) & .899 (.03) \\
+3\,s   & .889 (.03) & .889 (.03) & .892 (.03) & .891 (.03) & .889 (.03) \\
+4\,s   & .906 (.02) & .906 (.02) & .910 (.02) & .908 (.02) & .906 (.02) \\
+6\,s   & .924 (.02) & .924 (.02) & .929 (.01) & .927 (.01) & .925 (.01) \\
+8\,s   & .924 (.02) & .925 (.02) & .927 (.02) & .924 (.02) & .923 (.02) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The main takeaway is simple: \textbf{the rows change a lot, but the columns barely change.} In other words, varying how much reference audio the model hears has a huge effect, but varying how much fine-tuning data it receives barely matters.
+
+Specifically:
+\begin{itemize}[itemsep=2pt]
+    \item Going from 0\,s to 1.5\,s of reference audio (reading down the ``0 sent'' column) boosts similarity by +0.340. This is a massive improvement, achieved with no fine-tuning at all.
+    \item Going from 0 to 20 training sentences (reading across the 0.5\,s row, which shows the largest LoRA effect) boosts similarity by only +0.019.
+    \item At the 0\,s anchor---where we expected LoRA to matter most---20 sentences adds just +0.005, which is far smaller than the measurement noise (std = 0.05).
+\end{itemize}
+
+Table~\ref{tab:wer_grid} shows word error rates (how accurately the model says the right words).
+
+\begin{table}[H]
+\centering
+\caption{Word error rate (mean, with standard deviation in parentheses). Lower is better. Values above 1.0 indicate the model repeated or hallucinated words.}
+\label{tab:wer_grid}
+\small
+\begin{tabular}{@{}l ccccc@{}}
+\toprule
+\textbf{Anchor} & \textbf{0 sent} & \textbf{1 sent} & \textbf{5 sent} & \textbf{10 sent} & \textbf{20 sent} \\
+\midrule
+0\,s   & .298 (.55) & .298 (.55) & .140 (.07) & .159 (.10) & .142 (.08) \\
+0.5\,s & .081 (.10) & .069 (.09) & .039 (.08) & .054 (.08) & .055 (.07) \\
+1\,s   & .929 (1.1) & .929 (1.1) & .616 (.89) & .738 (.99) & .795 (1.0) \\
+1.5\,s & 2.61 (1.8) & 4.75 (5.6) & 6.07 (11.) & 4.73 (11.) & 3.48 (4.3) \\
+2\,s   & .108 (.17) & .108 (.17) & .120 (.18) & .092 (.15) & .108 (.18) \\
+3\,s   & .049 (.10) & .036 (.07) & .030 (.05) & .037 (.07) & .050 (.09) \\
+4\,s   & .139 (.19) & .139 (.19) & .177 (.23) & .165 (.22) & .160 (.20) \\
+6\,s   & .068 (.08) & .068 (.08) & .068 (.07) & .057 (.06) & .050 (.06) \\
+8\,s   & .063 (.08) & .063 (.08) & .053 (.08) & .043 (.07) & .030 (.06) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Most conditions have low WER (under 0.15), meaning the model says the right words. But the 1.5\,s anchor row stands out with extremely high WER (2.6--6.1). This means the model is repeating the target sentence multiple times---a serious failure we investigate in Section~\ref{sec:anchor_diag}.
+
+\subsection{Training Dynamics}
+
+During training, we tracked both the training loss (how well the model fits its training data) and speaker similarity (how much the output sounds like the target speaker). We saved the model weights from whichever epoch produced the highest similarity, not the lowest loss.
+
+Key observations:
+\begin{itemize}[itemsep=2pt]
+    \item With \textbf{1 sentence} (60 epochs): The best similarity (0.940) occurred very early, at epoch 3. After that, similarity bounced around between 0.879 and 0.940, never consistently improving.
+    \item With \textbf{5 sentences} (30 epochs): Best similarity (0.926) was reached only at the final epoch.
+    \item With \textbf{10 sentences} (20 epochs): Best similarity (0.925) at epoch 18.
+    \item With \textbf{20 sentences} (15 epochs): Best similarity (0.930) at epoch 6.
+\end{itemize}
+
+The training loss was noisy in all cases (jumping between 0.5 and 1.0), which is normal for flow-matching models. Importantly, lower training loss did not reliably lead to better speaker similarity. This confirms that we made the right choice to select checkpoints based on similarity rather than loss.
+
+\subsection{Anchor Duration Diagnostics}
+\label{sec:anchor_diag}
+
+The grid results revealed a surprising pattern: speaker similarity does not simply increase as we give the model more reference audio. Instead, it peaks at 1.5\,s, drops at 2--3\,s, and then climbs again at 4--8\,s. We ran additional diagnostics to understand why.
+
+\begin{table}[H]
+\centering
+\caption{Detailed diagnostics across anchor durations (no fine-tuning, single test sentence).}
+\label{tab:diag}
+\small
+\begin{tabular}{@{}l c c c l@{}}
+\toprule
+\textbf{Anchor} & \textbf{Similarity} & \textbf{WER} & \textbf{Output length} & \textbf{Reference text given to model} \\
+\midrule
+0.5\,s & 0.699 & 0.000 & 4.5\,s & ``The'' \\
+1\,s   & 0.863 & 0.000 & 9.2\,s & ``The'' \\
+1.5\,s & 0.934 & 1.111 & 13.8\,s & ``The'' \\
+2\,s   & 0.833 & 0.111 & 5.4\,s & ``The birch canoe'' \\
+3\,s   & 0.867 & 0.000 & 4.8\,s & ``The birch canoe slid on the'' \\
+4\,s   & 0.939 & 0.000 & 4.3\,s & ``The birch canoe slid on the smooth planks.'' \\
+6\,s   & 0.930 & 0.000 & 3.7\,s & (74 characters) \\
+8\,s   & 0.929 & 0.000 & 3.7\,s & (99 characters) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The diagnostics reveal two distinct problems:
+
+\textbf{Problem 1: Repetition at 1.5\,s.} At 1.5\,s, the reference text is only ``The'' (3 characters), but the reference audio is 1.5 seconds long. The model uses the ratio of audio length to text length to estimate how long the output should be. With so little text and comparatively long audio, it wildly overestimates the output duration (13.8\,s for a sentence that should take about 4\,s). With all that extra time to fill, the model simply says the sentence twice: ``the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dogs.''
+
+\textbf{Problem 2: Dip at 2--3\,s.} At 2\,s, the reference text becomes ``The birch canoe''---a sentence fragment that cuts off mid-thought. This confuses the text-audio alignment that F5-TTS relies on, leading to worse voice matching. By 4\,s, the reference text reaches a complete sentence (``The birch canoe slid on the smooth planks.''), and performance recovers.
+
+We also checked whether the model accidentally mixes words from the reference text into its output (``content leakage''). It does not---at all anchor durations, the generated speech contains only the intended target sentence.
+
+\subsection{LoRA Rank Sweep}
+
+Since LoRA fine-tuning barely helped in the main experiment, we asked: would a \emph{bigger} LoRA adapter do better? We tested this at the hardest condition---0\,s anchor (no reference audio at all), 20 training sentences---where LoRA has the most potential to help.
+
+\begin{table}[H]
+\centering
+\caption{Effect of LoRA adapter size at 0\,s anchor with 20 training sentences. Rank controls the number of trainable parameters.}
+\label{tab:rank}
+\begin{tabular}{@{}r r c c@{}}
+\toprule
+\textbf{Rank} & \textbf{Trainable params} & \textbf{Similarity} & \textbf{WER} \\
+\midrule
+2  & 630K   & 0.594 $\pm$ 0.054 & 0.281 $\pm$ 0.553 \\
+4  & 1.26M  & 0.598 $\pm$ 0.053 & 0.140 $\pm$ 0.088 \\
+8  & 2.52M  & 0.600 $\pm$ 0.061 & 0.154 $\pm$ 0.098 \\
+16 & 5.05M  & 0.618 $\pm$ 0.063 & 0.179 $\pm$ 0.088 \\
+32 & 10.1M  & 0.638 $\pm$ 0.062 & 0.203 $\pm$ 0.141 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Multiplying the adapter size by 16$\times$ (from 630K to 10.1M parameters) improves similarity by only +0.044 (from 0.594 to 0.638). For comparison, just giving the model 1 second of reference audio (with no fine-tuning at all) reaches 0.904---far beyond what any amount of LoRA fine-tuning achieves.
+
+Even worse, bigger adapters make the speech less accurate: WER rises from 0.140 at rank 4 to 0.203 at rank 32. The larger adapters seem to memorize how the training sentences \emph{sound} (their rhythm and pacing), rather than learning what the speaker's voice \emph{is}. This leads to speech that slightly resembles the speaker but does not say the right words as clearly.
+
+% ──────────────────────────────────────────────
+\section{Discussion}
+
+\subsection{Reference Audio Is Far More Powerful Than Fine-Tuning}
+
+The central finding of this project is that giving the model reference audio at generation time is roughly \textbf{14 times more effective} than fine-tuning for capturing a speaker's voice. Reference audio provides a +0.340 similarity boost; the best fine-tuning result is +0.025.
+
+Why is the gap so large? Reference audio gives the model \emph{direct evidence} of what the speaker sounds like---their pitch, tone, pace, and vocal quality are right there in the audio signal. Fine-tuning, on the other hand, tries to store this information indirectly as small weight changes that must work across all possible inputs. With only 20 training sentences (about 2 minutes of audio), the model simply cannot learn a rich enough representation of the speaker's voice to compete with hearing them directly.
+
+\subsection{Our Hypothesis Was Wrong}
+
+We expected fine-tuning to compensate when reference audio is short or absent. The data does not support this. At the 0\,s anchor condition---where fine-tuning has the best chance to help---20 sentences of training adds only +0.005 to similarity. This improvement (0.595 vs.\ 0.590) is ten times smaller than the standard deviation (0.05), meaning it could easily be random noise.
+
+At longer anchor durations (6--8\,s), fine-tuning sometimes makes things \emph{slightly worse} (deltas of $-$0.001 to $-$0.002). When the model already has a strong reference signal, fine-tuning can introduce subtle distortions rather than improvements.
+
+\subsection{There Is an Optimal Anchor Length}
+
+Speaker similarity does not simply go up as the reference clip gets longer. We observe a peak at 1.5\,s, a dip at 2--3\,s, and recovery at 4--8\,s. This happens because of how F5-TTS handles the reference text:
+
+\begin{itemize}[itemsep=4pt]
+    \item At \textbf{1.5\,s}, the model has enough audio to capture the speaker's voice, but the reference text is very short (``The''), causing a duration estimation error that leads to repetition.
+    \item At \textbf{2--3\,s}, the reference text is a sentence fragment (``The birch canoe''), which disrupts the text-audio alignment the model depends on.
+    \item At \textbf{4\,s+}, the reference text reaches a complete sentence, and everything works well.
+\end{itemize}
+
+In practice, the \textbf{3\,s anchor} is the best trade-off. It achieves the lowest WER (0.049) with a competitive similarity of 0.889, and avoids the repetition problem. Anchors of 6--8\,s improve similarity to 0.924 but with diminishing returns.
+
+\subsection{What This Means for Vocal Preservation}
+
+Our findings have direct implications for building voice cloning tools for patients:
+
+\begin{enumerate}[itemsep=4pt]
+    \item \textbf{Very little audio is needed.} Just 3--8 seconds of clear speech produces good results (similarity above 0.89, word accuracy above 93\%). A patient in early stages of vocal decline can record this in under a minute.
+
+    \item \textbf{Fine-tuning is not worth the effort.} The small gains from LoRA (+0.025 at best) do not justify the computational cost, extra data collection, or risk of introducing errors. A system that simply feeds reference audio to F5-TTS at generation time is simpler, cheaper, and just as effective.
+
+    \item \textbf{Quality of the reference clip matters more than length.} The difference between a 3\,s and 8\,s anchor is only +0.035 similarity. A short, clean recording is better than a long, noisy one.
+
+    \item \textbf{The reference text must match the audio.} The repetition failure at 1.5\,s shows that the model needs a proper transcript of the reference clip. Any mismatch between audio duration and text length can cause the model to repeat itself or produce garbled output.
+\end{enumerate}
+
+\subsection{Limitations}
+
+Our findings come with several caveats:
+
+\begin{itemize}[itemsep=4pt]
+    \item \textbf{Single speaker.} We tested only one voice. Results might differ for speakers with unusual vocal qualities, accents, or voices affected by disease.
+
+    \item \textbf{Automated metrics only.} Our similarity metric (Resemblyzer) captures overall voice fingerprint similarity, but it does not measure whether the speech sounds natural, emotional, or expressive. A human listening study would give a more complete picture.
+
+    \item \textbf{One model architecture.} We tested only F5-TTS. Other voice cloning models (such as VALL-E or XTTS) might respond differently to fine-tuning.
+
+    \item \textbf{English only.} Our recordings and test sentences are all in English. The results may not transfer to other languages, which have different sound systems and alignment challenges.
+
+    \item \textbf{Same recording session.} The training data and reference audio come from the same recording. A real-world system would need to handle recordings made at different times, in different environments.
+\end{itemize}
+
+% ──────────────────────────────────────────────
+\section{Conclusion}
+
+We set out to learn when LoRA fine-tuning helps with voice cloning in F5-TTS. After testing 45 conditions and generating 675 audio samples, the answer is: \textbf{it mostly does not.}
+
+Giving the model a short reference audio clip is far more effective than fine-tuning. Reference audio provides about 14 times more improvement to speaker similarity than the best fine-tuning result. Even making the fine-tuning adapter 16 times larger cannot approach what 1 second of reference audio achieves.
+
+For anyone building a vocal preservation tool, the practical advice is simple: collect 3--8 seconds of clean speech from the target speaker and use F5-TTS's zero-shot mode. No fine-tuning is needed.
+
+Along the way, we discovered that there is a sweet spot for reference audio length (3--8\,s), that certain lengths can cause the model to repeat itself (due to text-audio misalignment), and that bigger LoRA adapters trade speech accuracy for small similarity gains. These insights help us understand how modern text-to-speech models use reference audio, and where their current limitations lie.
+
+Future work should test multiple speakers (including those with vocal impairments), add human listening evaluations, and explore whether different adaptation strategies (beyond LoRA) can better encode speaker identity into the model.
+
+% ──────────────────────────────────────────────
+\bibliographystyle{plainnat}
+\begin{thebibliography}{9}
+
+\bibitem[Chen et~al.(2024)]{chen2024f5tts}
+Y.~Chen, Z.~Chen, et~al.
+\newblock F5-TTS: A Fairytaler that Fakes Fluent and Faithful Speech with Flow Matching.
+\newblock \emph{arXiv preprint arXiv:2410.06885}, 2024.
+
+\bibitem[Hu et~al.(2022)]{hu2022lora}
+E.~J.~Hu, Y.~Shen, P.~Wallis, Z.~Allen-Zhu, Y.~Li, S.~Wang, L.~Wang, and W.~Chen.
+\newblock LoRA: Low-Rank Adaptation of Large Language Models.
+\newblock In \emph{Proceedings of ICLR}, 2022.
+
+\bibitem[Wan et~al.(2018)]{wan2018generalized}
+L.~Wan, Q.~Wang, A.~Papir, and I.~L.~Moreno.
+\newblock Generalized End-to-End Loss for Speaker Verification.
+\newblock In \emph{Proceedings of ICASSP}, 2018.
+
+\bibitem[Radford et~al.(2023)]{radford2023robust}
+A.~Radford, J.~W.~Kim, T.~Xu, G.~Brockman, C.~McLeavey, and I.~Sutskever.
+\newblock Robust Speech Recognition via Large-Scale Weak Supervision.
+\newblock In \emph{Proceedings of ICML}, 2023.
+
+\bibitem[Rothauser et~al.(1969)]{rothauser1969ieee}
+E.~H.~Rothauser et~al.
+\newblock IEEE Recommended Practice for Speech Quality Measurements.
+\newblock \emph{IEEE Transactions on Audio and Electroacoustics}, 17(3):225--246, 1969.
+
+\end{thebibliography}
+
+\end{document}
