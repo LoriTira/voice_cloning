@@ -4,7 +4,7 @@
 
 This project investigates whether LoRA fine-tuning improves voice cloning quality beyond what in-context anchor audio conditioning already provides in [F5-TTS](https://arxiv.org/abs/2410.06885). The motivation is preserving the voices of people with neurodegenerative diseases (ALS, Parkinson's) who are gradually losing their ability to speak.
 
-> Course project for MIT 6.S898 — Deep Learning (Spring 2025)
+> Course project for MIT 15.773 — Hands On Deep Learning (Spring 2025)
 >
 > Authors: Arthur Schoen, Max Soderlind, Lorenzo Tiraboschi
 
@@ -43,8 +43,7 @@ Metric:            Speaker similarity (Resemblyzer cosine distance), averaged ov
 ├── notebook/
 │   └── f5_tts_voice_cloning.ipynb   # Full experiment (runs on Google Colab)
 └── report/
-    ├── HODL_Project_Report.tex       # LaTeX source
-    ├── HODL_Project_Report.pdf       # Compiled report
+    ├── HODL_Project_Report.pdf       # Project report
     └── figures/                      # Diagrams and plots
 ```
 
@@ -68,19 +67,6 @@ The notebook is designed to run end-to-end on Google Colab with a GPU runtime. I
 ## Data
 
 Training audio is not included in this repository due to size. The notebook expects an M4A file containing recordings of Harvard sentences. You can record your own or use any clear speech recording.
-
-## Citation
-
-If you use this work, please cite:
-
-```bibtex
-@misc{schoen2025fewshot,
-  title={Few-Shot Voice Cloning for Vocal Preservation: In-Context Conditioning vs. Parametric Adaptation in F5-TTS},
-  author={Schoen, Arthur and S{\"o}derlind, Max and Tiraboschi, Lorenzo},
-  year={2025},
-  note={MIT 6.S898 Deep Learning, Spring 2025}
-}
-```
 
 ## License
 
